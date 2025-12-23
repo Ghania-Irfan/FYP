@@ -34,8 +34,11 @@ class EyeCursorController:
         
         # Cursor smoothing (Exponential Moving Average)
         self.smoothing_factor = 0.5  # Higher = more smoothing (0-1) (reduced for more responsive movement)
+        # Start cursor at screen center
         self.last_cursor_x = self.screen_w // 2
         self.last_cursor_y = self.screen_h // 2
+        # Move cursor to center initially
+        pyautogui.moveTo(int(self.last_cursor_x), int(self.last_cursor_y))
         
         # Movement sensitivity
         self.sensitivity = 50  # Higher = faster cursor movement (increased for better responsiveness)
@@ -52,8 +55,19 @@ class EyeCursorController:
         
         # Calibration
         self.calibrated = False
-        self.calibration_points = []
-        self.gaze_center = None
+        self.calibration_samples = []  # Store multiple samples for averaging
+        self.calibration_data = {
+            'left_eye_center': None,
+            'right_eye_center': None,
+            'left_iris_center': None,
+            'right_iris_center': None,
+            'left_eye_width': None,
+            'left_eye_height': None,
+            'right_eye_width': None,
+            'right_eye_height': None,
+            'gaze_range_x': 0.15,  # Maximum expected gaze range (will be calibrated)
+            'gaze_range_y': 0.15
+        }
         
         # Eye landmark indices (MediaPipe Face Mesh)
         self.LEFT_EYE_INDICES = [33, 7, 163, 144, 145, 153, 154, 155, 133, 173, 157, 158, 159, 160, 161, 246]
@@ -99,27 +113,46 @@ class EyeCursorController:
         ear = (A + B) / (2.0 * C)
         return ear
     
-    def calculate_gaze_ratio(self, iris_center, eye_center, eye_width, eye_height):
+    def calculate_gaze_ratio(self, iris_center, eye_center, eye_width, eye_height, is_left_eye=True):
         """
-        Calculate gaze ratio: how far the iris is from eye center
+        Calculate gaze ratio relative to calibrated center
         Returns normalized values between -1 and 1
         """
-        # Calculate offset
-        offset_x = iris_center[0] - eye_center[0]
-        offset_y = iris_center[1] - eye_center[1]
+        if not self.calibrated:
+            return 0, 0
         
-        # Normalize by eye dimensions
-        gaze_ratio_x = offset_x / eye_width if eye_width > 0 else 0
-        gaze_ratio_y = offset_y / eye_height if eye_height > 0 else 0
+        # Get calibration data for this eye
+        if is_left_eye:
+            calib_eye_center = self.calibration_data['left_eye_center']
+            calib_iris_center = self.calibration_data['left_iris_center']
+            calib_eye_width = self.calibration_data['left_eye_width']
+        else:
+            calib_eye_center = self.calibration_data['right_eye_center']
+            calib_iris_center = self.calibration_data['right_iris_center']
+            calib_eye_width = self.calibration_data['right_eye_width']
         
-        # Apply non-linear scaling for better responsiveness (cubic curve)
-        # This makes small eye movements translate to larger cursor movements
-        gaze_ratio_x = np.sign(gaze_ratio_x) * (abs(gaze_ratio_x) ** 0.7) if gaze_ratio_x != 0 else 0
-        gaze_ratio_y = np.sign(gaze_ratio_y) * (abs(gaze_ratio_y) ** 0.7) if gaze_ratio_y != 0 else 0
+        if calib_eye_center is None:
+            return 0, 0
         
-        # Scale up the ratio for better sensitivity
-        gaze_ratio_x *= 2.0  # Amplify horizontal movement
-        gaze_ratio_y *= 2.0  # Amplify vertical movement
+        # Calculate offset from calibrated center
+        offset_x = (iris_center[0] - eye_center[0]) - (calib_iris_center[0] - calib_eye_center[0])
+        offset_y = (iris_center[1] - eye_center[1]) - (calib_iris_center[1] - calib_eye_center[1])
+        
+        # Normalize by eye width (use width as reference for both axes)
+        if calib_eye_width > 0:
+            gaze_ratio_x = offset_x / calib_eye_width
+            gaze_ratio_y = offset_y / calib_eye_width
+        else:
+            gaze_ratio_x = 0
+            gaze_ratio_y = 0
+        
+        # Scale by calibrated range
+        gaze_ratio_x = gaze_ratio_x / self.calibration_data['gaze_range_x']
+        gaze_ratio_y = gaze_ratio_y / self.calibration_data['gaze_range_y']
+        
+        # Apply non-linear scaling for better responsiveness
+        gaze_ratio_x = np.sign(gaze_ratio_x) * (abs(gaze_ratio_x) ** 0.8) if gaze_ratio_x != 0 else 0
+        gaze_ratio_y = np.sign(gaze_ratio_y) * (abs(gaze_ratio_y) ** 0.8) if gaze_ratio_y != 0 else 0
         
         # Clamp to reasonable range
         gaze_ratio_x = np.clip(gaze_ratio_x, -1.0, 1.0)
@@ -173,32 +206,29 @@ class EyeCursorController:
         return False
     
     def move_cursor(self, gaze_ratio_x, gaze_ratio_y):
-        """Move cursor based on gaze ratio"""
-        # Calculate movement delta with enhanced sensitivity
-        # Use screen-relative movement for better control
-        delta_x = gaze_ratio_x * self.sensitivity
-        delta_y = gaze_ratio_y * self.sensitivity
+        """Move cursor based on gaze ratio - uses absolute positioning"""
+        if not self.calibrated:
+            return
         
-        # For larger gaze movements, increase speed (acceleration)
-        if abs(gaze_ratio_x) > 0.3:
-            delta_x *= 1.5
-        if abs(gaze_ratio_y) > 0.3:
-            delta_y *= 1.5
+        # Map gaze ratio to screen coordinates (absolute positioning)
+        # Center of screen is (0, 0) in gaze space
+        # Map -1 to 1 gaze range to full screen
         
-        # Calculate new cursor position
-        new_x = self.last_cursor_x + delta_x
-        new_y = self.last_cursor_y + delta_y
+        # Calculate target screen position
+        # Gaze ratio of -1 maps to 0, +1 maps to screen width/height
+        target_x = (gaze_ratio_x + 1.0) / 2.0 * self.screen_w
+        target_y = (gaze_ratio_y + 1.0) / 2.0 * self.screen_h
         
         # Clamp to screen boundaries
-        new_x = np.clip(new_x, 0, self.screen_w)
-        new_y = np.clip(new_y, 0, self.screen_h)
+        target_x = np.clip(target_x, 0, self.screen_w)
+        target_y = np.clip(target_y, 0, self.screen_h)
         
-        # Apply smoothing (less aggressive for more responsive movement)
-        smoothed_x = self.smoothing_factor * self.last_cursor_x + (1 - self.smoothing_factor) * new_x
-        smoothed_y = self.smoothing_factor * self.last_cursor_y + (1 - self.smoothing_factor) * new_y
+        # Apply smoothing for smooth movement
+        smoothed_x = self.smoothing_factor * self.last_cursor_x + (1 - self.smoothing_factor) * target_x
+        smoothed_y = self.smoothing_factor * self.last_cursor_y + (1 - self.smoothing_factor) * target_y
         
         # Only move if there's significant change (reduce jitter)
-        if abs(smoothed_x - self.last_cursor_x) > 0.5 or abs(smoothed_y - self.last_cursor_y) > 0.5:
+        if abs(smoothed_x - self.last_cursor_x) > 1.0 or abs(smoothed_y - self.last_cursor_y) > 1.0:
             # Update cursor position
             pyautogui.moveTo(int(smoothed_x), int(smoothed_y))
         
@@ -206,25 +236,54 @@ class EyeCursorController:
         self.last_cursor_x = smoothed_x
         self.last_cursor_y = smoothed_y
     
-    def calibrate(self, landmarks):
-        """Simple calibration: set current gaze as center"""
-        # Calculate average eye centers
+    def calibrate(self, landmarks=None, finalize=False):
+        """Calibrate: collect samples and store averaged calibration data"""
+        if finalize:
+            # Finalize calibration by averaging all collected samples
+            if len(self.calibration_samples) > 0:
+                # Average all samples for stable calibration
+                self.calibration_data['left_eye_center'] = np.mean([s['left_eye_center'] for s in self.calibration_samples], axis=0)
+                self.calibration_data['right_eye_center'] = np.mean([s['right_eye_center'] for s in self.calibration_samples], axis=0)
+                self.calibration_data['left_iris_center'] = np.mean([s['left_iris_center'] for s in self.calibration_samples], axis=0)
+                self.calibration_data['right_iris_center'] = np.mean([s['right_iris_center'] for s in self.calibration_samples], axis=0)
+                self.calibration_data['left_eye_width'] = np.mean([s['left_eye_width'] for s in self.calibration_samples])
+                self.calibration_data['left_eye_height'] = np.mean([s['left_eye_height'] for s in self.calibration_samples])
+                self.calibration_data['right_eye_width'] = np.mean([s['right_eye_width'] for s in self.calibration_samples])
+                self.calibration_data['right_eye_height'] = np.mean([s['right_eye_height'] for s in self.calibration_samples])
+                
+                self.calibrated = True
+                self.calibration_samples = []  # Clear samples
+                return True
+            return False
+        
+        if landmarks is None:
+            return False
+        
+        # Calculate eye centers
         left_eye_center = self.calculate_eye_center(landmarks, self.LEFT_EYE_INDICES)
         right_eye_center = self.calculate_eye_center(landmarks, self.RIGHT_EYE_INDICES)
         
-        # Calculate average iris centers
+        # Calculate iris centers
         left_iris_center = self.calculate_iris_center(landmarks, self.LEFT_IRIS_INDICES)
         right_iris_center = self.calculate_iris_center(landmarks, self.RIGHT_IRIS_INDICES)
         
-        # Store calibration data
-        self.gaze_center = {
-            'left_eye': left_eye_center,
-            'right_eye': right_eye_center,
-            'left_iris': left_iris_center,
-            'right_iris': right_iris_center
+        # Calculate eye dimensions
+        left_eye_width, left_eye_height = self.calculate_eye_dimensions(landmarks, self.LEFT_EYE_INDICES)
+        right_eye_width, right_eye_height = self.calculate_eye_dimensions(landmarks, self.RIGHT_EYE_INDICES)
+        
+        # Store sample
+        sample = {
+            'left_eye_center': left_eye_center,
+            'right_eye_center': right_eye_center,
+            'left_iris_center': left_iris_center,
+            'right_iris_center': right_iris_center,
+            'left_eye_width': left_eye_width,
+            'left_eye_height': left_eye_height,
+            'right_eye_width': right_eye_width,
+            'right_eye_height': right_eye_height
         }
-        self.calibrated = True
-        print("✅ Calibration complete! Look at the center of the screen.")
+        self.calibration_samples.append(sample)
+        return True
     
     def process_frame(self, frame):
         """Process a single frame and update cursor"""
@@ -251,20 +310,21 @@ class EyeCursorController:
             left_eye_width, left_eye_height = self.calculate_eye_dimensions(landmarks, self.LEFT_EYE_INDICES)
             right_eye_width, right_eye_height = self.calculate_eye_dimensions(landmarks, self.RIGHT_EYE_INDICES)
             
-            # Calculate gaze ratios for both eyes
+            # Calculate gaze ratios for both eyes (relative to calibration)
             left_gaze_x, left_gaze_y = self.calculate_gaze_ratio(
-                left_iris_center, left_eye_center, left_eye_width, left_eye_height
+                left_iris_center, left_eye_center, left_eye_width, left_eye_height, is_left_eye=True
             )
             right_gaze_x, right_gaze_y = self.calculate_gaze_ratio(
-                right_iris_center, right_eye_center, right_eye_width, right_eye_height
+                right_iris_center, right_eye_center, right_eye_width, right_eye_height, is_left_eye=False
             )
             
             # Average both eyes for better accuracy
             avg_gaze_x = (left_gaze_x + right_gaze_x) / 2.0
             avg_gaze_y = (left_gaze_y + right_gaze_y) / 2.0
             
-            # Move cursor
-            self.move_cursor(avg_gaze_x, avg_gaze_y)
+            # Move cursor only if calibrated
+            if self.calibrated:
+                self.move_cursor(avg_gaze_x, avg_gaze_y)
             
             # Blink detection
             left_ear = self.calculate_eye_aspect_ratio(landmarks, self.LEFT_EYE_INDICES)
@@ -319,19 +379,23 @@ class EyeCursorController:
         
         # Display information
         info_y = 30
+        status_color = (0, 255, 0) if self.calibrated else (0, 0, 255)
+        status_text = "CALIBRATED" if self.calibrated else "NOT CALIBRATED"
+        cv2.putText(frame, f"Status: {status_text}", 
+                   (10, info_y), cv2.FONT_HERSHEY_SIMPLEX, 0.6, status_color, 2)
         cv2.putText(frame, f"Gaze: X={gaze_x:.3f}, Y={gaze_y:.3f}", 
-                   (10, info_y), cv2.FONT_HERSHEY_SIMPLEX, 0.6, (255, 255, 255), 2)
-        cv2.putText(frame, f"EAR: L={left_ear:.2f}, R={right_ear:.2f}", 
                    (10, info_y + 25), cv2.FONT_HERSHEY_SIMPLEX, 0.6, (255, 255, 255), 2)
+        cv2.putText(frame, f"EAR: L={left_ear:.2f}, R={right_ear:.2f}", 
+                   (10, info_y + 50), cv2.FONT_HERSHEY_SIMPLEX, 0.6, (255, 255, 255), 2)
         cv2.putText(frame, f"Sensitivity: {self.sensitivity} (Press +/- to adjust)", 
-                   (10, info_y + 50), cv2.FONT_HERSHEY_SIMPLEX, 0.5, (200, 200, 0), 1)
-        cv2.putText(frame, "Press 'C' to calibrate | 'Q' to quit", 
                    (10, info_y + 75), cv2.FONT_HERSHEY_SIMPLEX, 0.5, (200, 200, 0), 1)
+        cv2.putText(frame, "Press 'C' to recalibrate | 'Q' to quit", 
+                   (10, info_y + 100), cv2.FONT_HERSHEY_SIMPLEX, 0.5, (200, 200, 0), 1)
         
         # Show cursor position on screen
         cursor_info = f"Cursor: ({int(self.last_cursor_x)}, {int(self.last_cursor_y)})"
         cv2.putText(frame, cursor_info, 
-                   (10, info_y + 100), cv2.FONT_HERSHEY_SIMPLEX, 0.5, (0, 255, 255), 1)
+                   (10, info_y + 125), cv2.FONT_HERSHEY_SIMPLEX, 0.5, (0, 255, 255), 1)
         
         # Draw gaze direction indicator
         center_x, center_y = frame_w // 2, frame_h // 2
@@ -374,8 +438,81 @@ def main():
     cap.set(cv2.CAP_PROP_FRAME_HEIGHT, 480)
     
     print("✅ Webcam initialized")
-    print("⏳ Starting in 2 seconds...\n")
-    time.sleep(2)
+    print("\n🔧 AUTOMATIC CALIBRATION")
+    print("   Please look at the CENTER of your screen")
+    print("   Keep your head still and look straight ahead")
+    print("   Calibration will start in 3 seconds...\n")
+    
+    # Automatic calibration
+    calibration_frames = 30  # Collect 30 frames for stable calibration
+    calibration_collected = 0
+    calibration_started = False
+    
+    print("Starting calibration in 3...")
+    time.sleep(1)
+    print("2...")
+    time.sleep(1)
+    print("1...")
+    time.sleep(1)
+    print("🔍 Calibrating... Look at the center of the screen!\n")
+    
+    # Calibration loop
+    while not controller.calibrated:
+        ret, frame = cap.read()
+        if not ret:
+            print("❌ Error: Could not read frame")
+            break
+        
+        frame = cv2.flip(frame, 1)
+        rgb_frame = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
+        results = controller.face_mesh.process(rgb_frame)
+        
+        frame_h, frame_w, _ = frame.shape
+        
+        if results.multi_face_landmarks:
+            landmarks = results.multi_face_landmarks[0]
+            
+            if not calibration_started:
+                calibration_started = True
+                print("✅ Face detected! Collecting calibration data...")
+            
+            # Collect calibration sample
+            controller.calibrate(landmarks)
+            calibration_collected += 1
+                
+            # Show progress
+            progress = int((calibration_collected / calibration_frames) * 100)
+            print(f"   Calibration progress: {progress}% ({calibration_collected}/{calibration_frames})", end='\r')
+            
+            if calibration_collected >= calibration_frames:
+                # Finalize calibration by averaging all samples
+                controller.calibrate(None, finalize=True)
+                print("\n\n✅ Calibration complete!")
+                print("   You can now move your eyes to control the cursor")
+                print("   Press 'C' to recalibrate anytime\n")
+                time.sleep(1)
+                break
+        else:
+            if calibration_started:
+                print("\n⚠️  Face lost! Please look at the camera...")
+                calibration_started = False
+                calibration_collected = 0
+        
+        # Draw calibration message
+        cv2.putText(frame, "CALIBRATION: Look at CENTER of screen", 
+                   (50, frame_h // 2 - 50), cv2.FONT_HERSHEY_SIMPLEX, 0.8, (0, 255, 255), 2)
+        cv2.putText(frame, f"Progress: {calibration_collected}/{calibration_frames}", 
+                   (50, frame_h // 2), cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0, 255, 255), 2)
+        cv2.putText(frame, "Keep your head still!", 
+                   (50, frame_h // 2 + 40), cv2.FONT_HERSHEY_SIMPLEX, 0.6, (0, 255, 0), 2)
+        
+        cv2.imshow('Eye Controlled Cursor - Calibration', frame)
+        
+        if cv2.waitKey(1) & 0xFF == ord('q'):
+            print("\n👋 Calibration cancelled")
+            return
+    
+    print("🚀 Starting cursor control...\n")
     
     # Main loop
     while True:
@@ -396,13 +533,46 @@ def main():
             print("\n👋 Shutting down...")
             break
         elif key == ord('c'):
-            # Calibrate
-            rgb_frame = cv2.cvtColor(cv2.flip(frame, 1), cv2.COLOR_BGR2RGB)
-            results = controller.face_mesh.process(rgb_frame)
-            if results.multi_face_landmarks:
-                controller.calibrate(results.multi_face_landmarks[0])
-            else:
-                print("❌ No face detected. Please look at the camera.")
+            # Recalibrate
+            print("\n🔧 Recalibration requested...")
+            print("   Look at the CENTER of your screen")
+            print("   Keep your head still...")
+            controller.calibrated = False
+            controller.calibration_samples = []  # Reset samples
+            
+            # Collect calibration samples
+            calibration_frames = 30
+            calibration_collected = 0
+            
+            for _ in range(calibration_frames * 2):  # Allow more time
+                ret, calib_frame = cap.read()
+                if not ret:
+                    break
+                
+                calib_frame = cv2.flip(calib_frame, 1)
+                rgb_frame = cv2.cvtColor(calib_frame, cv2.COLOR_BGR2RGB)
+                results = controller.face_mesh.process(rgb_frame)
+                
+                if results.multi_face_landmarks:
+                    landmarks = results.multi_face_landmarks[0]
+                    controller.calibrate(landmarks)
+                    calibration_collected += 1
+                    if calibration_collected >= calibration_frames:
+                        controller.calibrate(None, finalize=True)
+                        print("✅ Recalibration complete!\n")
+                        break
+                
+                # Show calibration progress
+                frame_h, frame_w = calib_frame.shape[:2]
+                cv2.putText(calib_frame, "RECALIBRATING: Look at CENTER", 
+                           (50, frame_h // 2 - 30), cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0, 255, 255), 2)
+                cv2.putText(calib_frame, f"Progress: {calibration_collected}/{calibration_frames}", 
+                           (50, frame_h // 2), cv2.FONT_HERSHEY_SIMPLEX, 0.6, (0, 255, 255), 2)
+                cv2.imshow('Eye Controlled Cursor', calib_frame)
+                cv2.waitKey(1)
+            
+            if not controller.calibrated:
+                print("❌ Recalibration failed. Please try again.\n")
         elif key == ord('+') or key == ord('='):
             # Increase sensitivity
             controller.sensitivity = min(controller.sensitivity + 5, 200)
